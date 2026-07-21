@@ -1,0 +1,27 @@
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv
+venv
+*.egg
+
+# Project files
+.firebase
+.firebaserc
+firebase.json
+public
+piper
+Giao\ trinh
+*.xlsx
+*.md
+*.bat
+*.log
+*.txt
+
+# Other
+.git
+.gitignore
+.claude
+.DS_Store
