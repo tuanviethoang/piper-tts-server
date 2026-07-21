@@ -1,27 +1,16 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy requirements and install
+# Install deps. edge-tts is a lightweight async network client — no ONNX models to pre-download
+# (unlike the old Piper build), so the image is small and runtime starts instantly.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download both voice models into the image (first run also verifies piper works).
-# This makes runtime start instantly with no network dependency.
-RUN mkdir -p /app/voices && \
-    echo "hello" | python -m piper --model en_US-amy-medium \
-        --download-dir /app/voices --data-dir /app/voices \
-        --output_file /tmp/warmup_en.wav && \
-    echo "xin chao" | python -m piper --model vi_VN-vais1000-medium \
-        --download-dir /app/voices --data-dir /app/voices \
-        --output_file /tmp/warmup_vi.wav && \
-    rm -f /tmp/warmup_en.wav /tmp/warmup_vi.wav
-
-# Copy server code
+# Copy server code (still named piper_server.py so render.yaml / this CMD don't need changing;
+# it now uses edge-tts, not Piper — see the file header).
 COPY piper_server.py .
 
-# Expose port
 EXPOSE 8080
 
-# Run server
 CMD ["uvicorn", "piper_server:app", "--host", "0.0.0.0", "--port", "8080"]

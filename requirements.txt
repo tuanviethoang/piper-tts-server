@@ -1,4 +1,5 @@
 fastapi==0.104.1
 uvicorn==0.24.0
-piper-tts==1.2.0
-python-multipart==0.0.6
+# Microsoft Edge free Neural voices (no API key). >=6.1.12 has the Sec-MS-GEC token handling
+# Microsoft now requires — older versions fail with 403/invalid-response against the live endpoint.
+edge-tts>=6.1.12
