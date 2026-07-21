@@ -1,180 +1,113 @@
 #!/usr/bin/env python3
 """
-Piper TTS server for TypingTrainer.
-Runs on Google Cloud Run, accepts text and language, returns MP3 audio.
+Piper TTS server for TypingTrainer (Render.com).
+POST /tts {text, lang, speed} -> WAV audio.
+Uses the piper CLI (python -m piper) so it works with piper-tts 1.2.0 as-is.
 """
 
 import os
-import io
-import sys
-import json
-import asyncio
-from contextlib import asynccontextmanager
+import subprocess
+import tempfile
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Import Piper TTS
-try:
-    from piper.voice import PiperVoice
-    from piper.download import find_voices_dir, ensure_voice_exists
-except ImportError:
-    print("ERROR: Piper TTS not installed. Run: pip install piper-tts")
-    sys.exit(1)
-
-# ---- Configuration ----
 PORT = int(os.environ.get("PORT", 8080))
-PIPER_VOICES = {
+VOICES = {
     "en": "en_US-amy-medium",
     "vi": "vi_VN-vais1000-medium",
 }
+# Voices are pre-downloaded into the image at build time (see Dockerfile)
+DATA_DIR = os.environ.get("PIPER_DATA_DIR", "/app/voices")
 
-# ---- Global state ----
-voices = {}  # lang -> PiperVoice instance
-voices_lock = asyncio.Lock()
+app = FastAPI(title="Piper TTS Server")
 
-
-async def init_voices():
-    """Initialize Piper voices on startup."""
-    global voices
-    async with voices_lock:
-        if voices:
-            return  # Already initialized
-
-        try:
-            # Ensure voices are downloaded
-            for lang, voice_name in PIPER_VOICES.items():
-                print(f"Ensuring {lang} voice: {voice_name}")
-                try:
-                    ensure_voice_exists(voice_name, download_dir=None, progress_callback=None)
-                except Exception as e:
-                    print(f"Warning: Could not ensure voice: {e}")
-
-            # Load voices
-            voices_dir = find_voices_dir()
-            print(f"Voices directory: {voices_dir}")
-
-            for lang, voice_name in PIPER_VOICES.items():
-                try:
-                    voice = PiperVoice.load(voice_name, voices_dir=voices_dir)
-                    voices[lang] = voice
-                    print(f"Loaded {lang} voice: {voice_name}")
-                except Exception as e:
-                    print(f"ERROR loading {lang} voice: {e}")
-                    raise
-        except Exception as e:
-            print(f"FATAL: Could not initialize voices: {e}")
-            raise
+# CORS: the typing app is served from Firebase Hosting (different origin),
+# so the browser needs these headers to be allowed to fetch audio.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-# ---- Request/Response models ----
 class TTSRequest(BaseModel):
     text: str
     lang: str = "en"
-    speed: float = 1.0  # Optional speech rate
-
-
-# ---- FastAPI lifespan ----
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialize Piper voices on startup."""
-    print("Starting Piper TTS server...")
-    await init_voices()
-    print("Piper TTS server ready!")
-    yield
-    print("Piper TTS server shutting down...")
-
-
-# ---- FastAPI app ----
-app = FastAPI(title="Piper TTS Server", lifespan=lifespan)
+    speed: float = 1.0
 
 
 @app.post("/tts")
-async def tts(request: TTSRequest, background_tasks: BackgroundTasks):
-    """
-    Generate speech from text using Piper TTS.
-    Returns MP3 audio data.
-
-    POST /tts
-    {
-        "text": "Hello world",
-        "lang": "en",
-        "speed": 1.0
-    }
-    """
-    text = str(request.text or "").strip()
-    lang = str(request.lang or "en").strip().lower()
-    speed = float(request.speed or 1.0)
+def tts(req: TTSRequest):
+    text = (req.text or "").strip()
+    lang = (req.lang or "en").strip().lower()
+    speed = float(req.speed or 1.0)
 
     if not text:
         raise HTTPException(status_code=400, detail="Text is empty")
+    if lang not in VOICES:
+        raise HTTPException(status_code=400, detail=f"Unsupported lang: {lang}")
+    if not 0.3 <= speed <= 3.0:
+        speed = 1.0
 
-    if lang not in PIPER_VOICES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported language: {lang}. Supported: {list(PIPER_VOICES.keys())}"
-        )
+    length_scale = 1.0 / speed
 
-    if speed < 0.5 or speed > 2.0:
-        raise HTTPException(status_code=400, detail="Speed must be between 0.5 and 2.0")
-
+    out_path = None
     try:
-        # Ensure voice is loaded
-        if lang not in voices:
-            raise HTTPException(status_code=503, detail=f"Voice {lang} not loaded")
-
-        voice = voices[lang]
-
-        # Generate audio (WAV format)
-        wav_data = io.BytesIO()
-        voice.synthesize(text, wav_data, speaker=None, length_scale=1.0 / speed)
-        wav_data.seek(0)
-
-        # Return WAV audio
-        return StreamingResponse(
-            iter([wav_data.getvalue()]),
-            media_type="audio/wav",
-            headers={"Content-Disposition": "inline"}
+        fd, out_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        cmd = [
+            "python", "-m", "piper",
+            "--model", VOICES[lang],
+            "--download-dir", DATA_DIR,
+            "--data-dir", DATA_DIR,
+            "--length-scale", str(length_scale),
+            "--output_file", out_path,
+        ]
+        proc = subprocess.run(
+            cmd,
+            input=text.encode("utf-8"),
+            capture_output=True,
+            timeout=120,
         )
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", "replace")[-500:]
+            raise HTTPException(status_code=500, detail=f"Piper failed: {err}")
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"ERROR: TTS synthesis failed: {e}")
-        raise HTTPException(status_code=500, detail=f"TTS synthesis failed: {str(e)}")
+        with open(out_path, "rb") as f:
+            wav = f.read()
+        if not wav:
+            raise HTTPException(status_code=500, detail="Piper produced no audio")
+        return Response(content=wav, media_type="audio/wav")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="TTS timeout")
+    finally:
+        if out_path:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
 
 
 @app.get("/health")
-async def health():
-    """Health check endpoint."""
-    return {
-        "status": "ok",
-        "voices_loaded": list(voices.keys()),
-        "supported_languages": list(PIPER_VOICES.keys())
-    }
+def health():
+    return {"status": "ok", "supported_languages": list(VOICES.keys())}
 
 
 @app.get("/")
-async def root():
-    """Root endpoint - server info."""
+def root():
     return {
         "name": "Piper TTS Server",
-        "version": "1.0",
         "endpoints": {
-            "POST /tts": "Generate speech (expects JSON: {text, lang, speed})",
+            "POST /tts": "JSON {text, lang: en|vi, speed} -> audio/wav",
             "GET /health": "Health check",
-            "GET /": "This message"
-        }
+        },
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"Starting Piper TTS server on port {PORT}")
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=PORT,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
