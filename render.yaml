@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: piper-tts-server
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    port: 8080
+    env: static
+    staticPublishPath: ./
+    buildFilter:
+      paths:
+        - 'piper_server.py'
+        - 'requirements.txt'
+        - 'Dockerfile'
+        - '.dockerignore'
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.10"
